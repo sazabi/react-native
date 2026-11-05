@@ -1,0 +1,271 @@
+name: Publish to npm
+
+# Publish driven by the sazabi/gitops `react-native-sdk` unit:
+#   main → dist-tag `latest` (production promote; main is the release mirror)
+#
+# Publishing uses npm trusted publishing (OIDC); no npm token is involved.
+# The gitops handler (sazabi/gitops scripts/deploy/react-native-sdk.sh) pushes
+# the validated artifact (both entrypoints, their shared chunks, declarations,
+# and the generated package.json) to main, waits for this workflow, then
+# verifies the dist-tag on the registry. The channel refs stay accepted here
+# so a prerelease channel can return without touching this file.
+#
+# Source of truth for this package is sazabi/monorepo
+# packages/sdk/react-native-sdk. Design: docs/design/app/react-native-sdk/design.md there.
+
+on:
+  push:
+    branches:
+      - main
+      - "channel/dev"
+      - "channel/next"
+  workflow_dispatch:
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+# Repo-level default: no permissions. Each job opts in explicitly.
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write # Required for npm trusted publishing (OIDC)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "24"
+
+      - name: Verify Node.js and npm versions
+        run: |
+          node --version
+          npm --version
+
+      # A ref without release content is not an error: the bootstrap commit
+      # carries only this repository's own files, and the gitops handler
+      # always pushes release-manifest.json alongside dist.
+      - name: Check for release content
+        id: content
+        run: |
+          if [ -f release-manifest.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No release-manifest.json on this ref; nothing to publish."
+          fi
+
+      - name: Resolve dist-tag from ref
+        if: steps.content.outputs.present == 'true'
+        id: channel
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main) dist_tag="latest" ;;
+            channel/dev) dist_tag="dev" ;;
+            channel/next) dist_tag="next" ;;
+            *)
+              echo "::error::Unsupported publish ref: $GITHUB_REF_NAME"
+              exit 1
+              ;;
+          esac
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+
+      # Both entrypoints must be present. Shipping index without register (or
+      # either without declarations) produces a package whose documented early
+      # instrumentation import fails to resolve.
+      - name: Verify artifact exists
+        if: steps.content.outputs.present == 'true'
+        run: |
+          missing=""
+          for required in dist/index.js dist/register.js dist/index.d.ts dist/register.d.ts; do
+            [ -f "$required" ] || missing="$missing $required"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing release content:$missing. The gitops handler must push these before publishing."
+            exit 1
+          fi
+
+      - name: Verify distSha256 matches the dist tree
+        if: steps.content.outputs.present == 'true'
+        run: |
+          MANIFEST_SHA=$(node -p "require('./release-manifest.json').distSha256")
+          ACTUAL_SHA=$(find dist -type f | sort | xargs shasum -a 256 | shasum -a 256 | awk '{print $1}')
+          if [ "$MANIFEST_SHA" != "$ACTUAL_SHA" ]; then
+            echo "::error::dist tree SHA256 mismatch! Manifest: $MANIFEST_SHA, Actual: $ACTUAL_SHA"
+            exit 1
+          fi
+
+      - name: Verify manifest version matches package.json
+        if: steps.content.outputs.present == 'true'
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          MANIFEST_VERSION=$(node -p "require('./release-manifest.json').version")
+          if [ "$PKG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Version mismatch: package.json ($PKG_VERSION) != release-manifest.json ($MANIFEST_VERSION)"
+            exit 1
+          fi
+
+      - name: Verify version matches the channel
+        if: steps.content.outputs.present == 'true'
+        env:
+          DIST_TAG: ${{ steps.channel.outputs.dist_tag }}
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          case "$DIST_TAG" in
+            latest)
+              if [[ "$PKG_VERSION" == *-* ]]; then
+                echo "::error::latest must publish a bare semver, got prerelease $PKG_VERSION"
+                exit 1
+              fi
+              ;;
+            dev|next)
+              if [[ "$PKG_VERSION" != *"-${DIST_TAG}."* ]]; then
+                echo "::error::${DIST_TAG} channel requires a -${DIST_TAG}.* prerelease version, got $PKG_VERSION"
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Verify package metadata matches this repository
+        if: steps.content.outputs.present == 'true'
+        run: |
+          EXPECTED_REPOSITORY_URL="git+https://github.com/${GITHUB_REPOSITORY}.git"
+          ACTUAL_REPOSITORY_URL=$(node -p "(() => { const repo = require('./package.json').repository; return typeof repo === 'string' ? repo : repo?.url || ''; })()")
+
+          if [ "$ACTUAL_REPOSITORY_URL" != "$EXPECTED_REPOSITORY_URL" ]; then
+            echo "::error::package.json repository.url must be ${EXPECTED_REPOSITORY_URL} for npm provenance/trusted publishing. Found ${ACTUAL_REPOSITORY_URL}"
+            exit 1
+          fi
+
+      # The SDK's whole cost model is "the bundle is the cost": a runtime
+      # dependency here would mean the monorepo's generator guard was bypassed.
+      # react and react-native are peers, never dependencies.
+      - name: Verify zero runtime dependencies
+        if: steps.content.outputs.present == 'true'
+        run: |
+          DEPS=$(node -p "Object.keys(require('./package.json').dependencies ?? {}).join(',')")
+          if [ -n "$DEPS" ]; then
+            echo "::error::Published manifest declares runtime dependencies: ${DEPS}. @sazabi/react-native must ship dependency-free."
+            exit 1
+          fi
+
+      # No install step: the package is dependency-free apart from its two
+      # peers, so the bundle must run from nothing plus a stand-in for them.
+      # Both entrypoints are imported; register must never throw on a host
+      # with no XMLHttpRequest.
+      - name: Smoke test — import both entrypoints
+        if: steps.content.outputs.present == 'true'
+        run: |
+          # ESM resolution ignores NODE_PATH, so the stubs live in the
+          # checkout's own node_modules, which npm publish never packs.
+          mkdir -p node_modules/react-native node_modules/react
+          cat > node_modules/react-native/package.json <<'EOF'
+          { "name": "react-native", "version": "0.0.0-stub", "type": "module", "main": "index.js" }
+          EOF
+          cat > node_modules/react-native/index.js <<'EOF'
+          export const Platform = { OS: "ios", Version: "0", constants: {} };
+          export const AppState = { currentState: "active", addEventListener: () => ({ remove() {} }) };
+          export const View = () => null;
+          EOF
+          cat > node_modules/react/package.json <<'EOF'
+          { "name": "react", "version": "0.0.0-stub", "type": "module", "main": "index.js" }
+          EOF
+          cat > node_modules/react/index.js <<'EOF'
+          export const createElement = () => null;
+          EOF
+          node --input-type=module -e "
+            const sdk = await import('./dist/index.js');
+            for (const name of ['init', 'identify', 'reset', 'log', 'addEvent', 'flush', 'shutdown', 'trackNavigation', 'SazabiRoot']) {
+              if (typeof sdk[name] !== 'function') throw new Error(name + ' is not a function');
+            }
+            if (typeof sdk.SDK_VERSION !== 'string') throw new Error('SDK_VERSION is not a string');
+            await import('./dist/register.js');
+            console.log('import smoke OK (both entrypoints, no-XHR host, no dependencies)');
+          "
+
+      - name: Check if version is already published
+        if: steps.content.outputs.present == 'true'
+        id: version-check
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          echo "name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version 2>/dev/null; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published. Ensuring dist-tag only."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # npm provenance attestation requires a public repository; this mirror
+      # is public by its Terraform declaration, so provenance is requested
+      # whenever the repository reports itself public.
+      - name: Publish to npm
+        if: steps.content.outputs.present == 'true' && steps.version-check.outputs.already_published == 'false'
+        env:
+          DIST_TAG: ${{ steps.channel.outputs.dist_tag }}
+          REPO_IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          flags="--access public --tag $DIST_TAG"
+          if [ "$REPO_IS_PRIVATE" = "false" ]; then
+            flags="$flags --provenance"
+          else
+            echo "::warning::Repository is private; publishing without npm provenance (attestation requires a public repository)."
+          fi
+          # shellcheck disable=SC2086
+          npm publish $flags
+
+      # Rollback path: the version is already on the registry (an earlier SHA was
+      # re-promoted), so only the dist-tag needs to move. The registry REFUSES
+      # OIDC-exchanged credentials for dist-tag writes (trusted publishing is
+      # publish-only, established by the CLI's ENG-5188 drill), so this step is
+      # expected to fail loudly with the manual repoint command. Automated
+      # rollback is publish-forward: revert on main, bump, promote.
+      - name: Repoint dist-tag (already-published version)
+        if: steps.content.outputs.present == 'true' && steps.version-check.outputs.already_published == 'true'
+        env:
+          DIST_TAG: ${{ steps.channel.outputs.dist_tag }}
+          PACKAGE_NAME: ${{ steps.version-check.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.version-check.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          current="$(npm view "$PACKAGE_NAME" "dist-tags.${DIST_TAG}" 2>/dev/null || true)"
+          if [ "$current" = "$PACKAGE_VERSION" ]; then
+            echo "dist-tag ${DIST_TAG} already points at ${PACKAGE_VERSION}; nothing to do."
+            exit 0
+          fi
+
+          echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published and dist-tag ${DIST_TAG} points at ${current:-<unset>}. Trusted publishing cannot write dist-tags; repoint manually with an npm account that has publish rights: npm dist-tag add ${PACKAGE_NAME}@${PACKAGE_VERSION} ${DIST_TAG} — or roll back publish-forward (revert + bump + promote)."
+          exit 1
+
+      - name: Verify dist-tag points at this version
+        if: steps.content.outputs.present == 'true'
+        env:
+          DIST_TAG: ${{ steps.channel.outputs.dist_tag }}
+          PACKAGE_NAME: ${{ steps.version-check.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.version-check.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            resolved="$(npm view "$PACKAGE_NAME" "dist-tags.${DIST_TAG}" 2>/dev/null || true)"
+            if [ "$resolved" = "$PACKAGE_VERSION" ]; then
+              echo "dist-tag ${DIST_TAG} -> ${PACKAGE_VERSION} confirmed."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: dist-tag ${DIST_TAG} is '${resolved:-<unset>}', expected ${PACKAGE_VERSION}; retrying..."
+            sleep 10
+          done
+          echo "::error::dist-tag ${DIST_TAG} does not point at ${PACKAGE_VERSION} after publish."
+          exit 1
