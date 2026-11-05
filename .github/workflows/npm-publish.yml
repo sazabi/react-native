@@ -174,11 +174,14 @@ jobs:
           export const Platform = { OS: "ios", Version: "0", constants: {} };
           export const AppState = { currentState: "active", addEventListener: () => ({ remove() {} }) };
           export const View = () => null;
+          export const NativeModules = {};
+          export const TurboModuleRegistry = { get: () => null };
           EOF
           cat > node_modules/react/package.json <<'EOF'
           { "name": "react", "version": "0.0.0-stub", "type": "module", "main": "index.js" }
           EOF
           cat > node_modules/react/index.js <<'EOF'
+          export class Component {}
           export const createElement = () => null;
           EOF
           node --input-type=module -e "
