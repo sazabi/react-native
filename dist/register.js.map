@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "sources": ["../src/register.ts"],
+  "sourcesContent": [
+    "/**\n * Early-instrumentation entrypoint: `import \"@sazabi/react-native/register\"`.\n *\n * Importing this module installs the SDK's `XMLHttpRequest` patch as a\n * dormant, transparent passthrough at module-evaluation time, before any\n * other library's module-scope code can capture the prototype methods\n * (Metro evaluates an entry file's imports in order, and every static import\n * runs before the first statement). `init()` later activates it with\n * configuration; until then it observes nothing, stores nothing, and sends\n * nothing.\n *\n * Put this import above all other imports in your app's entry module.\n */\nimport { isWebHost } from \"./host\";\nimport { ensureNetworkPatches } from \"./network\";\n\ntry {\n  // react-native-web runs in a browser, where @sazabi/browser owns capture.\n  if (!isWebHost()) {\n    ensureNetworkPatches();\n  }\n} catch {\n  // Registration must never break the host app; init() re-ensures.\n}\n"
+  ],
+  "mappings": "qCAgBA,GAAI,CAEF,GAAI,CAAC,EAAU,EACb,EAAqB,EAEvB,KAAM",
+  "debugId": "1C55478F3E7B6A0D64756E2164756E21",
+  "names": []
+}
